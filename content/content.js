@@ -1,7 +1,6 @@
 (() => {
   let shouldStop = false;
 
-  // Listen for messages from popup
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === 'startScrape') {
       shouldStop = false;
@@ -18,17 +17,17 @@
 
       if (mode === 'current') {
         sendProgress(10, 'Scanning current page...');
-        data = scrapePage();
+        data = scrapeCurrentPage(document);
         sendProgress(80, `Found ${data.length} investors on this page`);
       } else if (mode === 'all') {
-        data = await scrapeAllPages();
+        data = await scrapeAllPages(filters);
       } else if (mode === 'profiles') {
         data = await scrapeWithProfiles();
       }
 
-      // Apply filters
+      // Apply local filters
       data = applyFilters(data, filters);
-      sendProgress(100, `Done! ${data.length} investors after filtering`);
+      sendProgress(100, `Done! ${data.length} investors total`);
 
       chrome.runtime.sendMessage({ action: 'scrapeResult', data });
       chrome.runtime.sendMessage({ action: 'scrapeComplete' });
@@ -37,281 +36,252 @@
     }
   }
 
-  // Scrape the current page's investor listings
-  function scrapePage() {
+  // ============================================================
+  // SCRAPE CURRENT PAGE - uses exact OpenVC DOM selectors
+  // ============================================================
+  function scrapeCurrentPage(doc) {
     const investors = [];
 
-    // Strategy 1: Try to extract from __NEXT_DATA__ (Next.js SSR data)
-    const nextDataEl = document.getElementById('__NEXT_DATA__');
-    if (nextDataEl) {
-      try {
-        const nextData = JSON.parse(nextDataEl.textContent);
-        const extracted = extractFromNextData(nextData);
-        if (extracted.length) return extracted;
-      } catch (e) {
-        // Fall through to DOM scraping
-      }
-    }
+    // OpenVC uses: table#results_tb tbody tr (excluding sponsor/ad rows)
+    const rows = doc.querySelectorAll('table#results_tb tbody tr:not(.sponsorRow)');
 
-    // Strategy 2: Scrape investor cards/rows from DOM
-    // OpenVC uses various card layouts - try multiple selectors
-    const selectors = [
-      // Table rows
-      'table tbody tr',
-      // Card-based layouts
-      '[class*="investor"] [class*="card"]',
-      '[class*="fund"] [class*="card"]',
-      'a[href*="/fund/"]',
-      // List items
-      '[class*="investor"] [class*="item"]',
-      '[class*="list"] [class*="row"]',
-      // Generic data rows
-      '[data-investor]',
-      '[data-fund]',
-    ];
-
-    // Try each selector strategy
-    for (const selector of selectors) {
-      const elements = document.querySelectorAll(selector);
-      if (elements.length > 0) {
-        elements.forEach(el => {
-          const investor = extractFromElement(el);
-          if (investor && investor.name) {
-            investors.push(investor);
-          }
-        });
-        if (investors.length > 0) break;
-      }
-    }
-
-    // Strategy 3: Find all links to /fund/ pages and extract names
-    if (investors.length === 0) {
-      const fundLinks = document.querySelectorAll('a[href*="/fund/"]');
-      fundLinks.forEach(link => {
-        const href = link.getAttribute('href');
-        const name = decodeURIComponent(href.split('/fund/')[1] || '').replace(/-/g, ' ');
-        if (name && !investors.find(i => i.name === name)) {
-          const container = link.closest('tr, [class*="card"], [class*="row"], [class*="item"], div') || link;
-          const investor = extractFromElement(container);
-          investor.name = investor.name || name;
-          investor.profileUrl = `https://www.openvc.app${href}`;
-          if (investor.name) investors.push(investor);
-        }
+    if (rows.length === 0) {
+      // Fallback: try any table with fund links
+      const fallbackRows = doc.querySelectorAll('table tbody tr');
+      fallbackRows.forEach(row => {
+        const investor = extractFromRow(row);
+        if (investor) investors.push(investor);
       });
-    }
 
-    // Strategy 4: Deep DOM scan - look for patterns
-    if (investors.length === 0) {
-      const allElements = document.querySelectorAll('div, article, section, li');
-      allElements.forEach(el => {
-        const text = el.textContent;
-        const links = el.querySelectorAll('a[href*="/fund/"]');
-        if (links.length === 1 && el.children.length > 1) {
-          const investor = extractFromElement(el);
-          const href = links[0].getAttribute('href');
-          investor.profileUrl = href.startsWith('http') ? href : `https://www.openvc.app${href}`;
-          if (investor.name) investors.push(investor);
-        }
-      });
-    }
-
-    return deduplicateInvestors(investors);
-  }
-
-  // Extract investor data from a DOM element (card, row, etc.)
-  function extractFromElement(el) {
-    const text = el.textContent || '';
-    const investor = {
-      name: '',
-      email: '',
-      website: '',
-      stage: '',
-      checkSize: '',
-      location: '',
-      sectors: '',
-      type: '',
-      leads: '',
-      description: '',
-      team: '',
-      profileUrl: '',
-    };
-
-    // Name: usually the first heading or strong element, or the link text
-    const nameEl = el.querySelector('h1, h2, h3, h4, h5, strong, [class*="name"], [class*="title"]');
-    const fundLink = el.querySelector('a[href*="/fund/"]');
-    if (nameEl) {
-      investor.name = nameEl.textContent.trim();
-    } else if (fundLink) {
-      investor.name = fundLink.textContent.trim() ||
-        decodeURIComponent(fundLink.getAttribute('href').split('/fund/')[1] || '');
-    }
-
-    // Profile URL
-    if (fundLink) {
-      const href = fundLink.getAttribute('href');
-      investor.profileUrl = href.startsWith('http') ? href : `https://www.openvc.app${href}`;
-    }
-
-    // Email: look for mailto or email patterns
-    const mailtoLink = el.querySelector('a[href^="mailto:"]');
-    if (mailtoLink) {
-      investor.email = mailtoLink.getAttribute('href').replace('mailto:', '');
-    } else {
-      const emailMatch = text.match(/[\w.-]+@[\w.-]+\.\w{2,}/);
-      if (emailMatch) investor.email = emailMatch[0];
-    }
-
-    // Website
-    const websiteLink = el.querySelector('a[href^="http"]:not([href*="openvc"])');
-    if (websiteLink) {
-      investor.website = websiteLink.getAttribute('href');
-    }
-
-    // Stage
-    const stages = ['pre-seed', 'seed', 'series a', 'series b', 'series c', 'growth', 'late stage'];
-    const lowerText = text.toLowerCase();
-    const foundStages = stages.filter(s => lowerText.includes(s));
-    investor.stage = foundStages.join(', ');
-
-    // Check size - look for currency patterns
-    const checkMatch = text.match(/[\$€£]\s*[\d,.]+\s*[kmb]?(?:\s*[-–]\s*[\$€£]?\s*[\d,.]+\s*[kmb]?)?/i) ||
-      text.match(/(?:up to|min|max)?\s*(?:USD|EUR|GBP)?\s*[\d,.]+\s*(?:k|m|mln|million|thousand)/i);
-    if (checkMatch) investor.checkSize = checkMatch[0].trim();
-
-    // Location
-    const locationEl = el.querySelector('[class*="location"], [class*="country"], [class*="geo"]');
-    if (locationEl) investor.location = locationEl.textContent.trim();
-
-    // Sectors
-    const sectorEl = el.querySelector('[class*="sector"], [class*="vertical"], [class*="industry"]');
-    if (sectorEl) investor.sectors = sectorEl.textContent.trim();
-
-    // Tags/pills that might contain stage, sector, or type info
-    const tags = el.querySelectorAll('[class*="tag"], [class*="pill"], [class*="badge"], [class*="chip"]');
-    if (tags.length) {
-      const tagTexts = [...tags].map(t => t.textContent.trim());
-      if (!investor.sectors) investor.sectors = tagTexts.join(', ');
-    }
-
-    // Type
-    const types = ['venture capital', 'angel', 'family office', 'corporate', 'accelerator', 'micro vc', 'syndicate'];
-    const foundType = types.find(t => lowerText.includes(t));
-    if (foundType) investor.type = foundType;
-
-    // Lead investor
-    if (lowerText.includes('lead') || lowerText.includes('leads')) {
-      investor.leads = 'Yes';
-    }
-
-    return investor;
-  }
-
-  // Extract data from Next.js __NEXT_DATA__
-  function extractFromNextData(data) {
-    const investors = [];
-
-    function traverse(obj, depth = 0) {
-      if (depth > 10 || !obj) return;
-      if (Array.isArray(obj)) {
-        obj.forEach(item => traverse(item, depth + 1));
-        return;
-      }
-      if (typeof obj === 'object') {
-        // Check if this looks like an investor/fund object
-        if (obj.name && (obj.email || obj.website || obj.checkSize || obj.stage || obj.fundName)) {
+      // If still nothing, try link-based extraction
+      if (investors.length === 0) {
+        const fundLinks = doc.querySelectorAll('a[href*="fund/"]');
+        const seen = new Set();
+        fundLinks.forEach(link => {
+          const href = link.getAttribute('href') || '';
+          if (!href.includes('fund/')) return;
+          const slug = href.split('fund/')[1];
+          if (!slug || seen.has(slug)) return;
+          seen.add(slug);
+          const name = decodeURIComponent(slug).replace(/-/g, ' ');
           investors.push({
-            name: obj.name || obj.fundName || obj.fund_name || '',
-            email: obj.email || obj.contact_email || '',
-            website: obj.website || obj.url || '',
-            stage: Array.isArray(obj.stage) ? obj.stage.join(', ') : (obj.stage || ''),
-            checkSize: obj.checkSize || obj.check_size || obj.ticket_size || '',
-            location: obj.location || obj.country || obj.hq || obj.headquarters || '',
-            sectors: Array.isArray(obj.sectors) ? obj.sectors.join(', ') :
-              (obj.sectors || obj.verticals || ''),
-            type: obj.type || obj.investor_type || '',
-            leads: obj.leads || obj.lead_investor || '',
-            description: obj.description || obj.bio || '',
-            team: Array.isArray(obj.team) ? obj.team.map(t => t.name || t).join(', ') :
-              (obj.team || ''),
-            profileUrl: obj.profileUrl || obj.url || '',
+            name,
+            email: '',
+            website: '',
+            stage: '',
+            checkSize: '',
+            location: '',
+            sectors: '',
+            type: '',
+            leads: '',
+            description: '',
+            team: '',
+            openRate: '',
+            profileUrl: `https://www.openvc.app/fund/${slug}`,
           });
-        }
-        Object.values(obj).forEach(v => traverse(v, depth + 1));
+        });
       }
+
+      return investors;
     }
 
-    traverse(data);
-    return deduplicateInvestors(investors);
+    rows.forEach(row => {
+      const investor = extractFromRow(row);
+      if (investor) investors.push(investor);
+    });
+
+    return investors;
   }
 
-  // Scrape all pages by auto-scrolling
+  // Extract investor data from a table row using OpenVC's exact structure
+  function extractFromRow(row) {
+    // Skip ad/sponsor rows
+    if (row.classList.contains('sponsorRow')) return null;
+
+    // Name: td.nameCell #invOverflow or td[data-label="Investor name"]
+    const nameCell = row.querySelector('td.nameCell') || row.querySelector('td[data-label="Investor name"]');
+    const nameEl = nameCell?.querySelector('#invOverflow') || nameCell?.querySelector('div');
+    const name = nameEl?.textContent?.trim() || '';
+    if (!name) return null;
+
+    // Profile URL from the fund link
+    const fundLink = row.querySelector('a.VClink') || row.querySelector('a[href*="fund/"]');
+    const href = fundLink?.getAttribute('href') || '';
+    const profileUrl = href.startsWith('http') ? href : `https://www.openvc.app/${href}`;
+
+    // Type: second div inside nameCell link (e.g. "VC firm", "Solo angel")
+    const typeEl = nameCell?.querySelectorAll('a.VClink > div, a.VClink div');
+    let type = '';
+    if (typeEl && typeEl.length > 1) {
+      type = typeEl[typeEl.length - 1]?.textContent?.trim() || '';
+    }
+    // Also check for type link like "investor-lists/angel-investors"
+    const typeLink = nameCell?.querySelector('a[href*="investor-lists/"]');
+    if (typeLink) type = typeLink.textContent.trim();
+
+    // Geography: td[data-label="Target countries"] badges
+    const geoCell = row.querySelector('td[data-label="Target countries"]');
+    const geoBadges = geoCell?.querySelectorAll('span.badge') || [];
+    const location = [...geoBadges].map(b => b.textContent.trim()).join(', ');
+
+    // Check size: td[data-label="Check size"]
+    const checkCell = row.querySelector('td[data-label="Check size"]');
+    const checkSize = checkCell?.textContent?.trim()?.replace(/\s+/g, ' ') || '';
+
+    // Stages: td[data-label="Funding stages"] badges
+    const stageCell = row.querySelector('td[data-label="Funding stages"]');
+    const stageBadges = stageCell?.querySelectorAll('span.badge') || [];
+    const stage = [...stageBadges].map(b => b.textContent.trim()).join(', ');
+
+    // Investment thesis: td.criteriaCell or td[data-label="Funding requirement"]
+    const thesisCell = row.querySelector('td.criteriaCell') || row.querySelector('td[data-label="Funding requirement"]');
+    const description = thesisCell?.textContent?.trim() || '';
+
+    // Open rate: td[data-label="Open rate"]
+    const openRateCell = row.querySelector('td[data-label="Open rate"]');
+    const openRate = openRateCell?.querySelector('span.h6')?.textContent?.trim() || '';
+
+    // Record ID from buttons
+    const recordBtn = row.querySelector('button.convertManual') || row.querySelector('button[data-id]');
+    const recordId = recordBtn?.getAttribute('data-id') || '';
+
+    // Email from mailto (rarely present in table, but check)
+    const mailtoLink = row.querySelector('a[href^="mailto:"]');
+    const email = mailtoLink ? mailtoLink.getAttribute('href').replace('mailto:', '') : '';
+
+    return {
+      name,
+      email,
+      website: '',
+      stage,
+      checkSize,
+      location,
+      sectors: description.substring(0, 200),
+      type,
+      leads: '',
+      description,
+      team: '',
+      openRate,
+      recordId,
+      profileUrl,
+    };
+  }
+
+  // ============================================================
+  // SCRAPE ALL PAGES - fetches each page via pagination
+  // ============================================================
   async function scrapeAllPages() {
     const allData = [];
-    let lastHeight = 0;
-    let attempts = 0;
-    const maxAttempts = 100;
 
-    sendProgress(5, 'Auto-scrolling to load all investors...');
+    // Get total pages from pagination
+    const lastPageEl = document.querySelector('#pageLast a') || document.querySelector('#pageLast');
+    const lastPageLink = lastPageEl?.getAttribute('href') || lastPageEl?.querySelector('a')?.getAttribute('href') || '';
+    let totalPages = 1;
 
-    while (attempts < maxAttempts && !shouldStop) {
-      // Scrape current visible content
-      const pageData = scrapePage();
-      const existingNames = new Set(allData.map(d => d.name));
-      const newItems = pageData.filter(d => !existingNames.has(d.name));
-      allData.push(...newItems);
+    // Try data-page attribute first
+    const dataPage = lastPageEl?.getAttribute('data-page') || lastPageEl?.querySelector('a')?.getAttribute('data-page');
+    if (dataPage) {
+      totalPages = parseInt(dataPage, 10);
+    } else {
+      // Parse from URL
+      const pageMatch = lastPageLink.match(/page=(\d+)/);
+      if (pageMatch) totalPages = parseInt(pageMatch[1], 10);
+    }
 
-      sendProgress(
-        Math.min(90, 5 + (attempts / maxAttempts) * 85),
-        `Found ${allData.length} investors... scrolling for more`
-      );
+    // Also try counting from the pagination nav
+    if (totalPages <= 1) {
+      const allPageLinks = document.querySelectorAll('#pagination a[data-page]');
+      allPageLinks.forEach(link => {
+        const p = parseInt(link.getAttribute('data-page'), 10);
+        if (p > totalPages) totalPages = p;
+      });
+    }
 
-      // Scroll down
-      window.scrollTo(0, document.body.scrollHeight);
-      await sleep(1500);
+    // If we still can't find pagination, try the investor count
+    if (totalPages <= 1) {
+      const countEl = document.querySelector('#resultsnbCont');
+      const countMatch = countEl?.textContent?.match(/([\d,]+)\s*investor/);
+      if (countMatch) {
+        const total = parseInt(countMatch[1].replace(/,/g, ''), 10);
+        totalPages = Math.ceil(total / 20);
+      }
+    }
 
-      // Click "Load More" or "Show More" buttons if present
-      const loadMoreBtn = document.querySelector(
-        'button[class*="load-more"], button[class*="show-more"], ' +
-        '[class*="load-more"] button, [class*="pagination"] button:last-child, ' +
-        'button:not([disabled])'
-      );
-      if (loadMoreBtn) {
-        const btnText = loadMoreBtn.textContent.toLowerCase();
-        if (btnText.includes('load') || btnText.includes('more') || btnText.includes('next')) {
-          loadMoreBtn.click();
-          await sleep(2000);
+    if (totalPages <= 1) totalPages = 304; // Fallback to known total
+
+    // Build base URL preserving current search filters
+    const currentUrl = new URL(window.location.href);
+    const baseUrl = `${currentUrl.origin}${currentUrl.pathname}`;
+    const params = new URLSearchParams(currentUrl.search);
+
+    sendProgress(1, `Found ${totalPages} pages. Starting scrape...`);
+
+    // Scrape current page first
+    const currentPageData = scrapeCurrentPage(document);
+    allData.push(...currentPageData);
+    sendProgress(2, `Page 1/${totalPages} — ${allData.length} investors`);
+
+    // Scrape remaining pages
+    for (let page = 2; page <= totalPages; page++) {
+      if (shouldStop) break;
+
+      const progress = 2 + ((page - 1) / totalPages) * 95;
+      sendProgress(progress, `Page ${page}/${totalPages} — ${allData.length} investors so far`);
+
+      try {
+        params.set('page', page);
+        const url = `${baseUrl}?${params.toString()}`;
+        const response = await fetch(url, {
+          credentials: 'include',
+          headers: {
+            'Accept': 'text/html',
+          },
+        });
+
+        if (!response.ok) {
+          console.warn(`Page ${page} returned ${response.status}, skipping`);
+          continue;
         }
+
+        const html = await response.text();
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const pageData = scrapeCurrentPage(doc);
+        allData.push(...pageData);
+
+        // Send intermediate results every 10 pages
+        if (page % 10 === 0) {
+          chrome.runtime.sendMessage({ action: 'scrapeResult', data: allData });
+        }
+      } catch (err) {
+        console.warn(`Failed to scrape page ${page}:`, err);
       }
 
-      // Check if we've reached the bottom
-      const newHeight = document.body.scrollHeight;
-      if (newHeight === lastHeight) {
-        attempts++;
-        if (attempts > 3) break;
-      } else {
-        attempts = 0;
-      }
-      lastHeight = newHeight;
+      // Polite delay to avoid rate limiting (300-600ms)
+      await sleep(300 + Math.random() * 300);
     }
 
     return deduplicateInvestors(allData);
   }
 
-  // Scrape by visiting each investor profile for detailed info
+  // ============================================================
+  // SCRAPE WITH PROFILE DETAILS - visits each /fund/ page
+  // ============================================================
   async function scrapeWithProfiles() {
-    sendProgress(5, 'Collecting investor profile links...');
+    sendProgress(2, 'Collecting investor links from current page...');
 
-    // First, gather all fund profile URLs from current/all pages
+    // Get all fund links from current page
     const links = new Set();
-    const fundLinks = document.querySelectorAll('a[href*="/fund/"]');
+    const fundLinks = document.querySelectorAll('a[href*="fund/"]');
     fundLinks.forEach(link => {
-      const href = link.getAttribute('href');
-      const fullUrl = href.startsWith('http') ? href : `https://www.openvc.app${href}`;
+      const href = link.getAttribute('href') || '';
+      if (!href.includes('fund/')) return;
+      const fullUrl = href.startsWith('http') ? href : `https://www.openvc.app/${href.replace(/^\//, '')}`;
       links.add(fullUrl);
     });
 
     if (links.size === 0) {
-      throw new Error('No investor profiles found on this page. Navigate to the search page first.');
+      throw new Error('No investor profiles found. Navigate to openvc.app/search first.');
     }
 
     const urls = [...links];
@@ -321,8 +291,8 @@
       if (shouldStop) break;
 
       sendProgress(
-        5 + (i / urls.length) * 90,
-        `Scraping profile ${i + 1}/${urls.length}...`
+        2 + (i / urls.length) * 95,
+        `Profile ${i + 1}/${urls.length} — ${allData.length} scraped`
       );
 
       try {
@@ -332,16 +302,15 @@
         console.warn(`Failed to scrape ${urls[i]}:`, e);
       }
 
-      // Polite delay between requests
-      await sleep(1000 + Math.random() * 1000);
+      await sleep(500 + Math.random() * 500);
     }
 
     return allData;
   }
 
-  // Fetch and parse a single investor profile page
+  // Scrape a single /fund/ profile page
   async function scrapeProfilePage(url) {
-    const response = await fetch(url);
+    const response = await fetch(url, { credentials: 'include' });
     const html = await response.text();
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
@@ -358,123 +327,172 @@
       leads: '',
       description: '',
       team: '',
+      openRate: '',
       profileUrl: url,
     };
 
-    // Try __NEXT_DATA__ first
-    const nextDataEl = doc.getElementById('__NEXT_DATA__');
-    if (nextDataEl) {
-      try {
-        const data = JSON.parse(nextDataEl.textContent);
-        const extracted = extractFromNextData(data);
-        if (extracted.length) return { ...extracted[0], profileUrl: url };
-      } catch (e) {}
-    }
-
-    // Name from title or h1
-    const title = doc.querySelector('title');
-    if (title) {
-      investor.name = title.textContent.split('|')[0].trim();
-    }
-    const h1 = doc.querySelector('h1');
+    // Name from h1 in #fundHeader
+    const h1 = doc.querySelector('#fundHeader h1') || doc.querySelector('h1');
     if (h1) investor.name = h1.textContent.trim();
+    if (!investor.name) {
+      const title = doc.querySelector('title');
+      if (title) investor.name = title.textContent.split('|')[0].trim();
+    }
 
-    // Extract from full page content
-    const fullData = extractFromElement(doc.body);
-    return {
-      ...investor,
-      ...fullData,
-      name: investor.name || fullData.name,
-      profileUrl: url,
-    };
+    // Website & LinkedIn from #socialIcons
+    const socialLinks = doc.querySelectorAll('#socialIcons a');
+    socialLinks.forEach(link => {
+      const href = link.getAttribute('href') || '';
+      if (href.includes('linkedin')) {
+        investor.linkedin = href;
+      } else if (href.startsWith('http')) {
+        investor.website = href;
+      }
+    });
+
+    // Parse detail tables (table.fundDetail)
+    const detailTables = doc.querySelectorAll('table.fundDetail');
+    detailTables.forEach(table => {
+      const rows = table.querySelectorAll('tr');
+      rows.forEach(row => {
+        const cells = row.querySelectorAll('td');
+        if (cells.length < 2) return;
+        const label = cells[0].textContent.trim().toLowerCase();
+        const value = cells[1].textContent.trim();
+
+        if (label.includes('who we are') || label.includes('description')) {
+          investor.description = value;
+        } else if (label.includes('firm type') || label.includes('type')) {
+          investor.type = value;
+        } else if (label.includes('global hq') || label.includes('headquarters')) {
+          investor.location = value;
+        } else if (label.includes('funding requirements') || label.includes('thesis')) {
+          investor.sectors = value.substring(0, 300);
+        } else if (label.includes('funding stages') || label.includes('stage')) {
+          const badges = cells[1].querySelectorAll('span.badge');
+          investor.stage = badges.length
+            ? [...badges].map(b => b.textContent.trim()).join(', ')
+            : value;
+        } else if (label.includes('check size')) {
+          investor.checkSize = value;
+          // Also try data attributes
+          const minAttr = cells[0].getAttribute('data-min');
+          const maxAttr = cells[0].getAttribute('data-max');
+          if (minAttr && maxAttr) {
+            investor.checkSizeMin = minAttr;
+            investor.checkSizeMax = maxAttr;
+          }
+        } else if (label.includes('target countries') || label.includes('geography')) {
+          const badges = cells[1].querySelectorAll('span.badge');
+          investor.location = badges.length
+            ? [...badges].map(b => b.textContent.trim()).join(', ')
+            : value;
+        } else if (label.includes('value add')) {
+          investor.valueAdd = value;
+        }
+      });
+    });
+
+    // Team members from #teamCont
+    const teamMembers = doc.querySelectorAll('table.teamDetail a.profileCont, #teamCont a.profileCont');
+    if (teamMembers.length) {
+      investor.team = [...teamMembers].map(el => el.textContent.trim()).join(', ');
+    }
+
+    // Email from mailto links
+    const mailtoLink = doc.querySelector('a[href^="mailto:"]');
+    if (mailtoLink) {
+      investor.email = mailtoLink.getAttribute('href').replace('mailto:', '');
+    }
+
+    return investor;
   }
 
-  // Apply user-selected filters
+  // ============================================================
+  // FILTERS
+  // ============================================================
   function applyFilters(data, filters) {
+    if (!filters) return data;
+
     return data.filter(item => {
-      // Stage filter
       if (filters.stages?.length) {
         const itemStage = (item.stage || '').toLowerCase();
-        const matches = filters.stages.some(s => itemStage.includes(s.replace('-', ' ')));
+        const matches = filters.stages.some(s => {
+          const stage = s.replace(/-/g, ' ');
+          return itemStage.includes(stage) ||
+            itemStage.includes('idea') && stage === 'pre seed' ||
+            itemStage.includes('prototype') && stage === 'seed' ||
+            itemStage.includes('early revenue') && stage === 'series a' ||
+            itemStage.includes('scaling') && stage === 'series b' ||
+            itemStage.includes('growth') && stage === 'growth';
+        });
         if (!matches) return false;
       }
 
-      // Check size filter
       if (filters.checkMin || filters.checkMax) {
         const size = parseCheckSize(item.checkSize);
+        if (size === 0) return true; // Keep if unparseable
         if (filters.checkMin && size < Number(filters.checkMin)) return false;
         if (filters.checkMax && size > Number(filters.checkMax)) return false;
       }
 
-      // Location filter
       if (filters.location) {
         const loc = (item.location || '').toLowerCase();
         const filterLoc = filters.location.toLowerCase();
         if (!filterLoc.split(',').some(l => loc.includes(l.trim()))) return false;
       }
 
-      // Sector filter
       if (filters.sector) {
-        const sectors = (item.sectors || '').toLowerCase();
-        const name = (item.name || '').toLowerCase();
-        const desc = (item.description || '').toLowerCase();
-        const combined = `${sectors} ${name} ${desc}`;
+        const combined = `${item.sectors} ${item.description} ${item.name}`.toLowerCase();
         const filterSectors = filters.sector.toLowerCase().split(',');
         if (!filterSectors.some(s => combined.includes(s.trim()))) return false;
       }
 
-      // Type filter
       if (filters.type) {
         const itemType = (item.type || '').toLowerCase();
-        if (!itemType.includes(filters.type.replace('-', ' '))) return false;
+        const filterType = filters.type.replace(/-/g, ' ').toLowerCase();
+        if (!itemType.includes(filterType)) return false;
       }
 
-      // Lead investor filter
-      if (filters.leadsOnly) {
-        if (!item.leads || item.leads.toLowerCase() === 'no') return false;
-      }
-
-      // Email only filter
-      if (filters.emailOnly) {
-        if (!item.email) return false;
-      }
+      if (filters.leadsOnly && (!item.leads || item.leads.toLowerCase() === 'no')) return false;
+      if (filters.emailOnly && !item.email) return false;
 
       return true;
     });
   }
 
-  // Parse check size string to number
+  // ============================================================
+  // HELPERS
+  // ============================================================
   function parseCheckSize(str) {
     if (!str) return 0;
-    const clean = str.replace(/[^0-9.kmb]/gi, '').toLowerCase();
-    const num = parseFloat(clean) || 0;
-    if (clean.includes('b')) return num * 1000000000;
-    if (clean.includes('m')) return num * 1000000;
-    if (clean.includes('k')) return num * 1000;
+    const match = str.match(/[\d,.]+\s*[kmb]?/gi);
+    if (!match) return 0;
+    const first = match[0].toLowerCase();
+    const num = parseFloat(first.replace(/[,]/g, '')) || 0;
+    if (first.includes('b')) return num * 1000000000;
+    if (first.includes('m')) return num * 1000000;
+    if (first.includes('k')) return num * 1000;
     return num;
   }
 
-  // Deduplicate by name
   function deduplicateInvestors(investors) {
     const seen = new Map();
     investors.forEach(inv => {
       if (!inv.name) return;
-      const existing = seen.get(inv.name);
+      const key = inv.name.toLowerCase().trim();
+      const existing = seen.get(key);
       if (!existing) {
-        seen.set(inv.name, inv);
+        seen.set(key, inv);
       } else {
-        // Merge - keep non-empty values
-        Object.keys(inv).forEach(key => {
-          if (inv[key] && !existing[key]) {
-            existing[key] = inv[key];
-          }
+        Object.keys(inv).forEach(k => {
+          if (inv[k] && !existing[k]) existing[k] = inv[k];
         });
       }
     });
     return [...seen.values()];
   }
 
-  // Send progress update to popup
   function sendProgress(progress, text) {
     chrome.runtime.sendMessage({
       action: 'scrapeProgress',
