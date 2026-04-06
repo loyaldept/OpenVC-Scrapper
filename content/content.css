@@ -1,0 +1,11 @@
+/* Visual indicator when scraping is active */
+.openvc-scrapper-active {
+  outline: 3px solid #6C5CE7 !important;
+  outline-offset: -3px;
+}
+
+/* Highlight scraped elements */
+.openvc-scrapper-scraped {
+  background-color: rgba(108, 92, 231, 0.05) !important;
+  transition: background-color 0.3s;
+}
